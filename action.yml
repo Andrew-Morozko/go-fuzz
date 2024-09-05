@@ -1,4 +1,4 @@
-name: 'Go fuzz'
+name: 'Go fuzz run'
 author: 'Andrew Morozko'
 description: Runs a single fuzz func and encrypts findings
 
