@@ -1,0 +1,156 @@
+name: 'Go fuzz'
+author: 'Andrew Morozko'
+description: |
+  Runs a single fuzz func.
+  If fuzzer fails, creates an issue with the encrypted patch file containing the failing test case and fuzzer log.
+
+  Patch file is encrypted with the PGP key contained in the given file (default: ./SECURITY.md) and is uploaded as an artifact.
+  It is intended to be used in conjunction with the `Go list fuzz targets` action, see github.com/Andrew-Morozko/go-fuzz-example.
+
+  Expects the project to be checked out and to have golang installed.
+  Requires the `issues: write` permission to create an issue.
+  Tested on `ubuntu-latest` runner.
+
+branding:
+  icon: 'target'
+  color: 'orange'
+
+inputs:
+  func:
+    description: 'Fuzz test function name'
+    required: true
+  package:
+    description: 'Package containing the fuzz test function'
+    required: true
+  pgp-key-file:
+    description: |
+      Encrypt the patch file with the pgp key from the given file.
+    default: './SECURITY.md'
+  tags:
+    description: 'Run fuzzer with these tags'
+    required: false
+    default: ''
+  fuzztime:
+    description: |
+      Time to run the fuzzer using go duration format (e.g. 10m).
+      See `go help testflag` for details.
+    required: true
+  fuzzminimizetime:
+    description: |
+      Time to run the fuzzer minimizer using go duration format (e.g. 10m).
+      See `go help testflag` for details.
+    required: false
+    default: ''
+
+runs:
+  using: "composite"
+  steps:
+    - name: Get fuzz corpus location
+      id: corpus
+      shell: bash
+      run: echo "corpus-location=$(go env GOCACHE)/fuzz" >> "$GITHUB_OUTPUT"
+
+    - name: Cache fuzz corpus
+      uses: actions/cache@v4
+      with:
+        save-always: true
+        path: ${{ steps.corpus.outputs.corpus-location }}
+        key: fuzz-corpus-${{ inputs.package }}/${{ inputs.func }}
+        enableCrossOsArchive: true
+
+    - name: Run fuzz test
+      id: run-fuzz
+      shell: bash
+      env:
+        FUNC: ${{inputs.func}}
+        PACKAGE: ${{inputs.package}}
+        TAGS: ${{inputs.tags && '-tags ${{inputs.tags}}' || ''}}
+        FUZZTIME: ${{inputs.fuzztime}}
+        FUZZMINTIME: ${{inputs.fuzzminimizetime && '-fuzzminimizetime ${{inputs.fuzzminimizetime}}' || ''}}
+      run: |
+        IFS=""
+        {
+          go test -fuzz "$FUNC" -fuzztime "$FUZZTIME" $FUZZMINTIME $TAGS "$PACKAGE" ||
+            echo "fuzzer-error=true" >> "$GITHUB_OUTPUT"
+        } | while read -r line; do
+              if [[ "$line" =~ ^( {4}|failure) ]]; then
+                echo "$line" >>./fuzzer-errors.log;
+              else
+                echo "$line"
+              fi
+            done
+
+    - name: Make patch
+      shell: bash
+      id: make-patch
+      if: ${{ steps.run-fuzz.outputs.fuzzer-error }}
+      env:
+        PGP_KEY_FILE: ${{inputs.pgp-key-file}}
+        PLAINTEXT_FILE: "${{runner.temp}}/fuzz.patch"
+        ENC_FILE: "${{github.workspace}}/fuzz.patch.enc"
+      run: |
+        echo "Staging files"
+        git add -A -f
+        if git diff --cached --exit-code > "$PLAINTEXT_FILE" ; then
+          echo "::error title="Fuzzer error"::Fuzzer exited with an error but no changes are present. This is likely a crash in the fuzzer.";
+          exit 1
+        fi
+        git reset --hard
+
+        gpg --encrypt --recipient-file "$PGP_KEY_FILE" --no-armor --cipher-algo AES256 --no-keyring --no-textmode --batch -o "$ENC_FILE" "$PLAINTEXT_FILE"
+
+        echo "patch-file=$(realpath "$ENC_FILE")" >> "$GITHUB_OUTPUT"
+        echo "artifact-name=fuzzer-error-$(sha256sum "$ENC_FILE" | head -c 16)" >> "$GITHUB_OUTPUT"
+        echo "commit-sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+    - name: Upload patch
+      if: ${{ steps.run-fuzz.outputs.fuzzer-error }}
+      uses: actions/upload-artifact@v4
+      id: upload-patch
+      with:
+        name: ${{ steps.make-patch.outputs.artifact-name }}
+        path: ${{ steps.make-patch.outputs.patch-file }}
+        compression-level: 0
+
+    - name: Create an issue
+      if: ${{ steps.run-fuzz.outputs.fuzzer-error }}
+      uses: actions/github-script@v7
+      id: create-issue
+      env:
+        FUNC: ${{ inputs.func }}
+        PACKAGE: ${{ inputs.package }}
+        ARTIFACT_NAME: ${{ steps.make-patch.outputs.artifact-name }}
+        ARTIFACT_URL: ${{ steps.upload-patch.outputs.artifact-url }}
+        COMMIT_SHA: ${{ steps.make-patch.outputs.commit-sha }}
+      with:
+        script: |
+          const func = process.env.FUNC;
+          const pkg = process.env.PACKAGE;
+          const artifactName = process.env.ARTIFACT_NAME;
+          const artifactUrl = process.env.ARTIFACT_URL;
+          const commitSha = process.env.COMMIT_SHA;
+
+          const issue = await github.rest.issues.create({
+            ...context.repo,
+            title: `Fuzzer ${func} failed`,
+            body: `Package: \`${pkg}\`
+          <!-- This fuzzer func is paused until this issue is closed or title/first line are edited -->
+
+          The results of the fuzzer run may be security-critical and were encrypted. To download, decrypt, and apply the patch, run the following commands:
+          \`\`\`bash
+          git fetch origin ${ commitSha }
+          git checkout -b fix-${artifactName} ${ commitSha }
+          gh run download -n ${artifactName}
+          gpg --decrypt ./fuzz.patch.enc | git apply --whitespace=nowarn
+          rm ./fuzz.patch.enc
+          \`\`\`
+
+          or download the encrypted patch file [here](${artifactUrl}) and apply it manually.
+          `});
+
+          await core.summary.addRaw(
+            `Fuzzer found an error. Check out [the issue](${issue.data.html_url}) for more details.`,
+            true,
+          ).write();
+          process.exitCode = 1;
+
