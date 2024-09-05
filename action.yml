@@ -1,15 +1,6 @@
 name: 'Go fuzz'
 author: 'Andrew Morozko'
-description: |
-  Runs a single fuzz func.
-  If fuzzer fails, creates an issue with the encrypted patch file containing the failing test case and fuzzer log.
-
-  Patch file is encrypted with the PGP key contained in the given file (default: ./SECURITY.md) and is uploaded as an artifact.
-  It is intended to be used in conjunction with the `Go list fuzz targets` action, see github.com/Andrew-Morozko/go-fuzz-example.
-
-  Expects the project to be checked out and to have golang installed.
-  Requires the `issues: write` permission to create an issue.
-  Tested on `ubuntu-latest` runner.
+description: Runs a single fuzz func and encrypts findings
 
 branding:
   icon: 'target'
